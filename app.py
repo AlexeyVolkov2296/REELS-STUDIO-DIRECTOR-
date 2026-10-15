@@ -13,11 +13,10 @@ from starlette.background import BackgroundTask
 
 app = FastAPI(
     title="Reels Studio Director API",
-    version="0.5.0"
+    version="0.6.0"
 )
 
 logger = logging.getLogger("reels_studio")
-
 MAX_UPLOAD_SIZE = 200 * 1024 * 1024
 
 VOSK_URL = (
@@ -29,9 +28,10 @@ VOSK_URL = (
 def health():
     return {
         "status": "ok",
+        "version": "0.6.0",
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "mode": "low_memory",
-        "smart_speech": "v3"
+        "smart_speech": "v5"
     }
 
 
@@ -57,8 +57,7 @@ async def save_upload(file, folder):
 
             if total > MAX_UPLOAD_SIZE:
                 raise HTTPException(
-                    413,
-                    "File exceeds 200 MB"
+                    413, "File exceeds 200 MB"
                 )
 
             target.write(chunk)
@@ -80,8 +79,7 @@ def run_command(command, timeout=180):
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(
-            504,
-            "Processing timed out"
+            504, "Processing timed out"
         )
 
     if result.returncode != 0:
@@ -89,7 +87,6 @@ def run_command(command, timeout=180):
             "Command failed: %s",
             result.stderr[-3000:]
         )
-
         raise HTTPException(
             422,
             "Processing failed: " + result.stderr[-800:]
@@ -112,8 +109,7 @@ def video_info(source):
         duration = float(result.stdout.strip())
     except ValueError:
         raise HTTPException(
-            422,
-            "Cannot read video duration"
+            422, "Cannot read video duration"
         )
 
     if not 0 < duration <= 60:
@@ -144,8 +140,7 @@ def send_video(output, folder, filename):
         or output.stat().st_size == 0
     ):
         raise HTTPException(
-            422,
-            "Output video was not created"
+            422, "Output video was not created"
         )
 
     return FileResponse(
@@ -163,31 +158,26 @@ def send_video(output, folder, filename):
 def render_segments(source, output, keep):
     if not keep or len(keep) > 12:
         raise HTTPException(
-            422,
-            "Too many edits for this free instance"
+            422, "Too many edits for this free instance"
         )
 
     filters = []
 
     for i, (a, b) in enumerate(keep):
-        segment_duration = b - a
-
-        fade = min(
-            0.025,
-            segment_duration / 4
-        )
+        length = b - a
+        fade = min(0.025, length / 4)
 
         filters.append(
-            f"[0:v]trim=start={a:.4f}:end={b:.4f},"
+            f"[0:v]trim=start={a:.5f}:end={b:.5f},"
             f"setpts=PTS-STARTPTS[v{i}]"
         )
 
         filters.append(
-            f"[0:a]atrim=start={a:.4f}:end={b:.4f},"
+            f"[0:a]atrim=start={a:.5f}:end={b:.5f},"
             f"asetpts=PTS-STARTPTS,"
             f"afade=t=in:st=0:d={fade:.4f},"
             f"afade=t=out:"
-            f"st={segment_duration-fade:.4f}:"
+            f"st={length-fade:.4f}:"
             f"d={fade:.4f}[a{i}]"
         )
 
@@ -217,10 +207,7 @@ def render_segments(source, output, keep):
         str(output)
     ]
 
-    run_command(
-        command,
-        timeout=180
-    )
+    run_command(command, timeout=180)
 
 
 @app.post("/trim")
@@ -231,8 +218,7 @@ async def trim_video(
 ):
     if start < 0 or not 0 < duration <= 120:
         raise HTTPException(
-            400,
-            "Invalid start or duration"
+            400, "Invalid start or duration"
         )
 
     folder = Path(
@@ -266,20 +252,94 @@ async def trim_video(
         run_command(command)
 
         return send_video(
-            output,
-            folder,
-            "trimmed.mp4"
+            output, folder, "trimmed.mp4"
         )
 
     except Exception:
-        shutil.rmtree(
-            folder,
-            ignore_errors=True
-        )
+        shutil.rmtree(folder, ignore_errors=True)
         raise
 
     finally:
         await file.close()
+
+
+def find_silences(source, duration, threshold):
+    result = run_command([
+        "ffmpeg",
+        "-hide_banner",
+        "-nostats",
+        "-i", str(source),
+        "-af",
+        f"silencedetect=noise=-35dB:d={threshold}",
+        "-vn",
+        "-f", "null",
+        "-"
+    ], timeout=90)
+
+    events = re.findall(
+        r"silence_(start|end):\s*([\d.]+)",
+        result.stderr
+    )
+
+    silences = []
+    start = None
+
+    for kind, value in events:
+        timestamp = float(value)
+
+        if kind == "start":
+            start = timestamp
+
+        elif start is not None:
+            a = max(0.0, min(start, duration))
+            b = max(a, min(timestamp, duration))
+
+            if b > a:
+                silences.append((a, b))
+
+            start = None
+
+    if start is not None:
+        a = max(0.0, min(start, duration))
+        if duration > a:
+            silences.append((a, duration))
+
+    return silences
+
+
+def keep_from_silences(
+    silences,
+    duration,
+    natural_pause,
+    max_cuts=10
+):
+    cuts = []
+
+    for a, b in silences:
+        if b - a <= natural_pause + 0.08:
+            continue
+
+        cut_start = a + natural_pause / 2
+        cut_end = b - natural_pause / 2
+
+        if cut_end - cut_start > 0.08:
+            cuts.append((cut_start, cut_end))
+
+    # Limit cuts without discarding the rest of the video.
+    cuts = cuts[:max_cuts]
+
+    keep = []
+    cursor = 0.0
+
+    for a, b in cuts:
+        if a > cursor + 0.04:
+            keep.append((cursor, a))
+        cursor = max(cursor, b)
+
+    if duration > cursor + 0.04:
+        keep.append((cursor, duration))
+
+    return keep or [(0.0, duration)]
 
 
 @app.post("/smart-speech")
@@ -300,93 +360,25 @@ async def smart_speech(
     try:
         source = await save_upload(file, folder)
         duration = video_info(source)
+
+        silences = find_silences(
+            source, duration, silence_threshold
+        )
+
+        keep = keep_from_silences(
+            silences, duration, 0.30
+        )
+
         output = folder / "smart_speech.mp4"
 
-        detection = run_command([
-            "ffmpeg",
-            "-hide_banner",
-            "-nostats",
-            "-i", str(source),
-            "-af",
-            f"silencedetect=noise=-35dB:d={silence_threshold}",
-            "-vn",
-            "-f", "null",
-            "-"
-        ], timeout=90)
-
-        events = re.findall(
-            r"silence_(start|end):\s*([\d.]+)",
-            detection.stderr
-        )
-
-        silences = []
-        silence_start = None
-
-        for kind, value in events:
-            timestamp = float(value)
-
-            if kind == "start":
-                silence_start = timestamp
-
-            elif silence_start is not None:
-                if timestamp > silence_start:
-                    silences.append(
-                        (silence_start, timestamp)
-                    )
-
-                silence_start = None
-
-        if silence_start is not None:
-            silences.append(
-                (silence_start, duration)
-            )
-
-        keep = []
-        cursor = 0.0
-        natural_pause = 0.30
-
-        for a, b in silences:
-            a = max(0.0, min(a, duration))
-            b = max(a, min(b, duration))
-
-            if b - a <= natural_pause:
-                continue
-
-            cut_start = a + natural_pause / 2
-            cut_end = b - natural_pause / 2
-
-            if cut_start > cursor + 0.04:
-                keep.append(
-                    (cursor, cut_start)
-                )
-
-            cursor = max(cursor, cut_end)
-
-        if duration > cursor + 0.04:
-            keep.append(
-                (cursor, duration)
-            )
-
-        if not keep or len(keep) > 12:
-            keep = [(0.0, duration)]
-
-        render_segments(
-            source,
-            output,
-            keep
-        )
+        render_segments(source, output, keep)
 
         return send_video(
-            output,
-            folder,
-            "smart_speech_v2.mp4"
+            output, folder, "smart_speech_v2.mp4"
         )
 
     except Exception:
-        shutil.rmtree(
-            folder,
-            ignore_errors=True
-        )
+        shutil.rmtree(folder, ignore_errors=True)
         raise
 
     finally:
@@ -415,11 +407,7 @@ def vosk_words(source):
         requests.RequestException,
         ValueError
     ) as exc:
-        logger.warning(
-            "Vosk unavailable: %s",
-            exc
-        )
-
+        logger.warning("Vosk unavailable: %s", exc)
         raise HTTPException(
             502,
             "Vosk service unavailable or timed out"
@@ -437,9 +425,6 @@ def vosk_words(source):
 
 
 def repeated_word_cuts(words, duration):
-    # Remove only short adjacent duplicate words.
-    # Partial syllables are not detected here.
-
     cuts = []
 
     for prev, curr in zip(words, words[1:]):
@@ -456,11 +441,7 @@ def repeated_word_cuts(words, duration):
             b = float(prev["end"])
             c = float(curr["start"])
 
-        except (
-            KeyError,
-            TypeError,
-            ValueError
-        ):
+        except (KeyError, TypeError, ValueError):
             continue
 
         if (
@@ -471,20 +452,11 @@ def repeated_word_cuts(words, duration):
             and 0 <= c - b <= 0.20
             and 0 <= a < b <= duration
         ):
-            cut_a = max(
-                0.0,
-                a + 0.02
-            )
-
-            cut_b = min(
-                duration,
-                b - 0.02
-            )
+            cut_a = max(0.0, a + 0.02)
+            cut_b = min(duration, b - 0.02)
 
             if cut_b - cut_a >= 0.08:
-                cuts.append(
-                    (cut_a, cut_b)
-                )
+                cuts.append((cut_a, cut_b))
 
     cuts.sort()
     nonoverlap = []
@@ -494,9 +466,7 @@ def repeated_word_cuts(words, duration):
             not nonoverlap
             or a >= nonoverlap[-1][1]
         ):
-            nonoverlap.append(
-                (a, b)
-            )
+            nonoverlap.append((a, b))
 
     return nonoverlap[:8]
 
@@ -507,23 +477,13 @@ def keep_from_cuts(cuts, duration):
 
     for a, b in cuts:
         if a > cursor + 0.04:
-            keep.append(
-                (cursor, a)
-            )
-
-        cursor = max(
-            cursor,
-            b
-        )
+            keep.append((cursor, a))
+        cursor = max(cursor, b)
 
     if duration > cursor + 0.04:
-        keep.append(
-            (cursor, duration)
-        )
+        keep.append((cursor, duration))
 
-    return keep or [
-        (0.0, duration)
-    ]
+    return keep or [(0.0, duration)]
 
 
 @app.post("/smart-speech-v3")
@@ -535,47 +495,180 @@ async def smart_speech_v3(
     )
 
     try:
-        source = await save_upload(
-            file,
-            folder
-        )
-
+        source = await save_upload(file, folder)
         duration = video_info(source)
-
         words = vosk_words(source)
 
         cuts = repeated_word_cuts(
-            words,
-            duration
+            words, duration
         )
 
         keep = keep_from_cuts(
-            cuts,
-            duration
+            cuts, duration
         )
 
-        output = (
-            folder / "smart_speech_v3.mp4"
+        output = folder / "smart_speech_v3.mp4"
+
+        render_segments(source, output, keep)
+
+        return send_video(
+            output, folder, "smart_speech_v3.mp4"
         )
 
-        render_segments(
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+    finally:
+        await file.close()
+
+
+# ==========================================
+# SMART SPEECH V5 — AUTOMATIC SMOOTH EDITING
+# ==========================================
+
+def render_smooth_segments(source, output, keep):
+    if not keep or len(keep) > 11:
+        raise HTTPException(
+            422, "Too many segments"
+        )
+
+    if len(keep) == 1:
+        render_segments(source, output, keep)
+        return
+
+    transition = 0.06
+    lengths = [b - a for a, b in keep]
+
+    if any(
+        length <= transition * 3
+        for length in lengths
+    ):
+        render_segments(source, output, keep)
+        return
+
+    filters = []
+
+    for i, (a, b) in enumerate(keep):
+        filters.append(
+            f"[0:v]trim=start={a:.5f}:end={b:.5f},"
+            f"setpts=PTS-STARTPTS,"
+            f"fps=30,format=yuv420p,"
+            f"setsar=1[v{i}]"
+        )
+
+        filters.append(
+            f"[0:a]atrim=start={a:.5f}:end={b:.5f},"
+            f"asetpts=PTS-STARTPTS,"
+            f"aresample=48000,"
+            f"aformat=sample_fmts=fltp:"
+            f"sample_rates=48000:"
+            f"channel_layouts=stereo[a{i}]"
+        )
+
+    current_v = "v0"
+    current_a = "a0"
+    accumulated = lengths[0]
+
+    for i in range(1, len(keep)):
+        next_v = f"vx{i}"
+        next_a = f"ax{i}"
+
+        offset = accumulated - transition
+
+        filters.append(
+            f"[{current_v}][v{i}]"
+            f"xfade=transition=fade:"
+            f"duration={transition}:"
+            f"offset={offset:.5f}"
+            f"[{next_v}]"
+        )
+
+        filters.append(
+            f"[{current_a}][a{i}]"
+            f"acrossfade=d={transition}:"
+            f"c1=tri:c2=tri"
+            f"[{next_a}]"
+        )
+
+        current_v = next_v
+        current_a = next_a
+        accumulated += lengths[i] - transition
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-threads", "1",
+        "-filter_threads", "1",
+        "-filter_complex_threads", "1",
+        "-i", str(source),
+        "-filter_complex", ";".join(filters),
+        "-map", f"[{current_v}]",
+        "-map", f"[{current_a}]",
+        *encode_settings(),
+        str(output)
+    ]
+
+    run_command(command, timeout=180)
+
+
+@app.post("/smart-speech-v5")
+async def smart_speech_v5(
+    file: UploadFile = File(...),
+    silence_threshold: float = 0.45,
+    natural_pause: float = 0.20
+):
+    if not 0.3 <= silence_threshold <= 2.0:
+        raise HTTPException(
+            400,
+            "silence_threshold must be between 0.3 and 2.0"
+        )
+
+    if not 0.12 <= natural_pause <= 0.5:
+        raise HTTPException(
+            400,
+            "natural_pause must be between 0.12 and 0.5"
+        )
+
+    folder = Path(
+        tempfile.mkdtemp(prefix="reels_v5_")
+    )
+
+    try:
+        source = await save_upload(file, folder)
+        duration = video_info(source)
+
+        silences = find_silences(
             source,
-            output,
-            keep
+            duration,
+            silence_threshold
+        )
+
+        keep = keep_from_silences(
+            silences,
+            duration,
+            natural_pause,
+            max_cuts=5
+        )
+
+        output = folder / "smart_speech_v5.mp4"
+
+        render_smooth_segments(
+            source, output, keep
         )
 
         return send_video(
             output,
             folder,
-            "smart_speech_v3.mp4"
+            "smart_speech_v5.mp4"
         )
 
     except Exception:
-        shutil.rmtree(
-            folder,
-            ignore_errors=True
-        )
+        shutil.rmtree(folder, ignore_errors=True)
         raise
 
     finally:
         await file.close()
+
