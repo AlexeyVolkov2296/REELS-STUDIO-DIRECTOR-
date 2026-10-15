@@ -1,18 +1,19 @@
 
 import logging
 import json
-import os
 import re
 import shutil
 import subprocess
 import tempfile
 import wave
 from pathlib import Path
+from fractions import Fraction
 
 import requests
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
+from vosk_model import model_path, model_problem
 
 app = FastAPI(
     title="Reels Studio Director API",
@@ -158,7 +159,7 @@ def send_video(output, folder, filename):
     )
 
 
-def render_segments(source, output, keep):
+def render_segments(source, output, keep, *, video_options=()):
     if not keep or len(keep) > 12:
         raise HTTPException(
             422, "Too many edits for this free instance"
@@ -207,6 +208,7 @@ def render_segments(source, output, keep):
         "-map", "[vout]",
         "-map", "[aout]",
         *encode_settings(),
+        *video_options,
         str(output)
     ]
 
@@ -625,10 +627,7 @@ _v6_model_path = None
 
 
 def v6_model_path():
-    configured = os.environ.get("VOSK_MODEL_PATH")
-    if configured:
-        return Path(configured)
-    return Path("models/vosk-model-small-ru-0.22")
+    return model_path()
 
 
 def transcribe_v6(source, folder):
@@ -655,6 +654,9 @@ def transcribe_v6(source, folder):
     ], timeout=90)
     try:
         if _v6_model is None or _v6_model_path != model_path:
+            problem = model_problem(model_path)
+            if problem:
+                raise HTTPException(503, problem + "; run download_vosk_model.py")
             SetLogLevel(-1)
             _v6_model = Model(str(model_path))
             _v6_model_path = model_path
@@ -825,6 +827,26 @@ def v6_keep_segments(report):
     return keep_from_cuts(cuts, duration)
 
 
+def v6_video_options(source):
+    result = run_command([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate,avg_frame_rate", "-of", "json", str(source),
+    ], timeout=30)
+    streams = json.loads(result.stdout).get("streams", [])
+    if not streams:
+        raise HTTPException(422, "Video stream not found")
+    try:
+        nominal = Fraction(streams[0]["r_frame_rate"])
+        average = Fraction(streams[0]["avg_frame_rate"])
+        if nominal > 0 and nominal == average:
+            # concat has a microsecond time base and can otherwise mux the last
+            # frame with zero duration. Retain the source rational CFR explicitly.
+            return ["-r", str(nominal), "-fps_mode", "cfr"]
+    except (KeyError, ValueError, ZeroDivisionError):
+        pass
+    return ["-fps_mode", "vfr"]
+
+
 @app.post("/smart-speech-v6")
 async def smart_speech_v6(
     file: UploadFile = File(...),
@@ -846,7 +868,7 @@ async def smart_speech_v6(
         keep = v6_keep_segments(report)
         output = folder / "smart_speech_v6.mp4"
         # Synchronized hard cuts avoid xfade face ghosting and preserve source FPS.
-        render_segments(source, output, keep)
+        render_segments(source, output, keep, video_options=v6_video_options(source))
         response = send_video(output, folder, "smart_speech_v6.mp4")
         response.headers["X-Smart-Speech-Report"] = json.dumps(
             {"proposed_deletions": report["proposed_deletions"]}, ensure_ascii=False

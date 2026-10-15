@@ -8,13 +8,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from vosk import Model, KaldiRecognizer, SetLogLevel
+from vosk_model import model_path, model_problem
 
 app = FastAPI(
     title="Reels Vosk Speech Analyzer",
     version="0.1.0"
 )
 
-MODEL_PATH = Path("models/vosk-model-small-ru-0.22")
+MODEL_PATH = model_path()
 MAX_SIZE = 50 * 1024 * 1024
 
 SetLogLevel(-1)
@@ -24,7 +25,7 @@ SetLogLevel(-1)
 def health():
     return {
         "status": "ok",
-        "model_exists": MODEL_PATH.is_dir(),
+        "model_exists": model_problem(MODEL_PATH, verify_hashes=False) is None,
         "ffmpeg": shutil.which("ffmpeg") is not None
     }
 
@@ -53,8 +54,9 @@ async def analyze_speech(file: UploadFile = File(...)):
         if size == 0:
             raise HTTPException(400, "Empty file")
 
-        if not MODEL_PATH.is_dir():
-            raise HTTPException(503, "Vosk model not found")
+        problem = model_problem(MODEL_PATH)
+        if problem:
+            raise HTTPException(503, problem + "; run download_vosk_model.py")
 
         try:
             subprocess.run(
