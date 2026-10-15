@@ -1,15 +1,19 @@
 
 import logging
+import json
 import re
 import shutil
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
+from fractions import Fraction
 
 import requests
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
+from vosk_model import model_path, model_problem
 
 app = FastAPI(
     title="Reels Studio Director API",
@@ -155,7 +159,7 @@ def send_video(output, folder, filename):
     )
 
 
-def render_segments(source, output, keep):
+def render_segments(source, output, keep, *, video_options=()):
     if not keep or len(keep) > 12:
         raise HTTPException(
             422, "Too many edits for this free instance"
@@ -204,6 +208,7 @@ def render_segments(source, output, keep):
         "-map", "[vout]",
         "-map", "[aout]",
         *encode_settings(),
+        *video_options,
         str(output)
     ]
 
@@ -612,6 +617,268 @@ def render_smooth_segments(source, output, keep):
     ]
 
     run_command(command, timeout=180)
+
+
+# SMART SPEECH V6 uses local Vosk word timings and only removes highly
+# supported retries. Model loading is lazy so V5 and the other endpoints
+# continue to work when the optional model is not installed.
+_v6_model = None
+_v6_model_path = None
+
+
+def v6_model_path():
+    return model_path()
+
+
+def transcribe_v6(source, folder):
+    global _v6_model, _v6_model_path
+    model_path = v6_model_path()
+    if not model_path.is_dir():
+        raise HTTPException(
+            503,
+            "Local Russian Vosk model is missing; set VOSK_MODEL_PATH",
+        )
+    try:
+        from vosk import KaldiRecognizer, Model, SetLogLevel
+    except ImportError as exc:
+        raise HTTPException(
+            503,
+            "Install the optional Vosk runtime from requirements-vosk.txt",
+        ) from exc
+
+    audio_path = folder / "v6_audio.wav"
+    run_command([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-threads", "1", "-i", str(source), "-vn", "-ac", "1",
+        "-ar", "16000", "-c:a", "pcm_s16le", str(audio_path),
+    ], timeout=90)
+    try:
+        if _v6_model is None or _v6_model_path != model_path:
+            problem = model_problem(model_path)
+            if problem:
+                raise HTTPException(503, problem + "; run download_vosk_model.py")
+            SetLogLevel(-1)
+            _v6_model = Model(str(model_path))
+            _v6_model_path = model_path
+        recognizer = KaldiRecognizer(_v6_model, 16000)
+        recognizer.SetWords(True)
+        words = []
+        with wave.open(str(audio_path), "rb") as audio:
+            while True:
+                chunk = audio.readframes(4000)
+                if not chunk:
+                    break
+                if recognizer.AcceptWaveform(chunk):
+                    words.extend(json.loads(recognizer.Result()).get("result", []))
+            words.extend(json.loads(recognizer.FinalResult()).get("result", []))
+        return words
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Local Vosk transcription failed")
+        raise HTTPException(502, "Local Russian speech recognition failed") from exc
+
+
+def _v6_token(word):
+    return str(word.get("word", "")).lower().strip(".,!?;:…—-()[]{}\"'«»")
+
+
+def _v6_confidence(word):
+    if "conf" not in word:
+        return None
+    try:
+        value = float(word.get("conf", 0.0))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, value))
+
+
+def _v6_safe_interval(words, start_index, end_index, reason, confidence):
+    """Return a deletion proposal only when its audio evidence is strong."""
+    first, last = words[start_index], words[end_index]
+    try:
+        start, end = float(first["start"]), float(last["end"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (0 <= start < end and end - start <= 4.0):
+        return None
+    return {
+        "start": round(start, 3), "end": round(end, 3),
+        "reason": reason, "confidence": round(confidence, 3),
+    }
+
+
+def detect_v6_retries(words, duration):
+    """Detect only adjacent stutters and short exact phrase restarts.
+
+    A cut is accepted only when the earlier take has low ASR confidence and
+    its retry is materially clearer. Equal-confidence repetitions are kept.
+    """
+    proposals = []
+    normalized = [_v6_token(word) for word in words]
+    count = len(words)
+    i = 0
+    while i < count:
+        token = normalized[i]
+        # Single-word stutter; leave fillers and short grammatical words alone.
+        if token and len(token) >= 3 and i + 1 < count and token == normalized[i + 1]:
+            first, retry = words[i], words[i + 1]
+            try:
+                gap = float(retry["start"]) - float(first["end"])
+            except (KeyError, TypeError, ValueError):
+                gap = 99
+            c1, c2 = _v6_confidence(first), _v6_confidence(retry)
+            if (c1 is not None and c2 is not None and 0 <= gap <= 0.35
+                    and c1 <= 0.55 and c2 >= 0.75 and c2 - c1 >= 0.25):
+                proposal = _v6_safe_interval(
+                    words, i, i, "low-confidence stutter corrected by clearer retry", c2 - c1
+                )
+                if proposal:
+                    proposals.append(proposal)
+                    i += 2
+                    continue
+
+        # Repeated 2–6 word phrase with a brief restart. Keep the clearer take.
+        matched = False
+        for size in range(min(6, (count - i) // 2), 1, -1):
+            j = i + size
+            if normalized[i:i + size] != normalized[j:j + size] or not all(normalized[i:i + size]):
+                continue
+            try:
+                gap = float(words[j]["start"]) - float(words[i + size - 1]["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not 0 <= gap <= 1.5:
+                continue
+            first_values = [_v6_confidence(w) for w in words[i:i + size]]
+            retry_values = [_v6_confidence(w) for w in words[j:j + size]]
+            if any(value is None for value in first_values + retry_values):
+                continue
+            first_conf = sum(first_values) / size
+            retry_conf = sum(retry_values) / size
+            if first_conf <= 0.50 and retry_conf >= 0.75 and retry_conf - first_conf >= 0.30:
+                proposal = _v6_safe_interval(
+                    words, i, i + size - 1,
+                    "low-confidence repeated phrase followed by a clearer take",
+                    retry_conf - first_conf,
+                )
+                if proposal:
+                    proposals.append(proposal)
+                    i += size * 2
+                    matched = True
+                    break
+        if not matched:
+            i += 1
+
+    proposals.sort(key=lambda item: item["start"])
+    safe = []
+    for proposal in proposals:
+        if proposal["end"] <= duration and (not safe or proposal["start"] >= safe[-1]["end"]):
+            safe.append(proposal)
+    return safe
+
+
+def detect_v6_long_pauses(silences, duration, min_pause=1.5, padding=0.30):
+    """Trim only the quiet center of long pauses, retaining audible padding."""
+    proposals = []
+    for start, end in silences:
+        start, end = max(0.0, float(start)), min(duration, float(end))
+        if end - start < min_pause:
+            continue
+        cut_start, cut_end = start + padding, end - padding
+        if cut_end - cut_start >= 0.5:
+            proposals.append({
+                "start": round(cut_start, 3), "end": round(cut_end, 3),
+                "reason": "center of long detected silence; 300 ms retained at each edge",
+                "confidence": 0.90,
+            })
+    return proposals
+
+
+def build_v6_report(words, silences, duration):
+    proposals = detect_v6_retries(words, duration)
+    proposals.extend(detect_v6_long_pauses(silences, duration))
+    proposals.sort(key=lambda item: item["start"])
+    # Overlapping proposals are ambiguous: report them but do not auto-cut.
+    selected = []
+    for proposal in proposals:
+        if selected and proposal["start"] < selected[-1]["end"]:
+            proposal["automatic"] = False
+            selected[-1]["automatic"] = False
+        elif sum(item["automatic"] for item in selected) >= 5:
+            # Keep reports useful without producing an unrenderable edit list.
+            proposal["automatic"] = False
+        else:
+            proposal["automatic"] = True
+        selected.append(proposal)
+    for proposal in selected:
+        proposal.setdefault("automatic", True)
+    return {
+        "version": "v6", "duration": round(duration, 3),
+        "language": "ru", "words": words,
+        "proposed_deletions": selected,
+        "note": "Only high-confidence non-overlapping proposals are applied; review all timecodes.",
+    }
+
+
+def v6_keep_segments(report):
+    duration = report["duration"]
+    cuts = [(item["start"], item["end"]) for item in report["proposed_deletions"] if item["automatic"]]
+    return keep_from_cuts(cuts, duration)
+
+
+def v6_video_options(source):
+    result = run_command([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate,avg_frame_rate", "-of", "json", str(source),
+    ], timeout=30)
+    streams = json.loads(result.stdout).get("streams", [])
+    if not streams:
+        raise HTTPException(422, "Video stream not found")
+    try:
+        nominal = Fraction(streams[0]["r_frame_rate"])
+        average = Fraction(streams[0]["avg_frame_rate"])
+        if nominal > 0 and nominal == average:
+            # concat has a microsecond time base and can otherwise mux the last
+            # frame with zero duration. Retain the source rational CFR explicitly.
+            return ["-r", str(nominal), "-fps_mode", "cfr"]
+    except (KeyError, ValueError, ZeroDivisionError):
+        pass
+    return ["-fps_mode", "vfr"]
+
+
+@app.post("/smart-speech-v6")
+async def smart_speech_v6(
+    file: UploadFile = File(...),
+    diagnostics_only: bool = False,
+    silence_threshold: float = 0.45,
+):
+    if not 0.3 <= silence_threshold <= 2.0:
+        raise HTTPException(400, "silence_threshold must be between 0.3 and 2.0")
+    folder = Path(tempfile.mkdtemp(prefix="reels_v6_"))
+    try:
+        source = await save_upload(file, folder)
+        duration = video_info(source)
+        words = transcribe_v6(source, folder)
+        silences = find_silences(source, duration, silence_threshold)
+        report = build_v6_report(words, silences, duration)
+        if diagnostics_only:
+            shutil.rmtree(folder, ignore_errors=True)
+            return JSONResponse(report)
+        keep = v6_keep_segments(report)
+        output = folder / "smart_speech_v6.mp4"
+        # Synchronized hard cuts avoid xfade face ghosting and preserve source FPS.
+        render_segments(source, output, keep, video_options=v6_video_options(source))
+        response = send_video(output, folder, "smart_speech_v6.mp4")
+        response.headers["X-Smart-Speech-Report"] = json.dumps(
+            {"proposed_deletions": report["proposed_deletions"]}, ensure_ascii=False
+        )
+        return response
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    finally:
+        await file.close()
 
 
 @app.post("/smart-speech-v5")
