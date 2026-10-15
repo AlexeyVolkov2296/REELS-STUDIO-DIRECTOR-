@@ -1,6 +1,4 @@
 
-
-
 import logging
 import re
 import shutil
@@ -8,18 +6,23 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import requests
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 app = FastAPI(
     title="Reels Studio Director API",
-    version="0.4.1"
+    version="0.5.0"
 )
 
 logger = logging.getLogger("reels_studio")
 
 MAX_UPLOAD_SIZE = 200 * 1024 * 1024
+
+VOSK_URL = (
+    "https://reels-vosk-test.onrender.com/analyze-speech"
+)
 
 
 @app.get("/health")
@@ -28,7 +31,7 @@ def health():
         "status": "ok",
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "mode": "low_memory",
-        "smart_speech": "v2"
+        "smart_speech": "v3"
     }
 
 
@@ -54,7 +57,8 @@ async def save_upload(file, folder):
 
             if total > MAX_UPLOAD_SIZE:
                 raise HTTPException(
-                    413, "File exceeds 200 MB"
+                    413,
+                    "File exceeds 200 MB"
                 )
 
             target.write(chunk)
@@ -76,7 +80,8 @@ def run_command(command, timeout=180):
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(
-            504, "Processing timed out"
+            504,
+            "Processing timed out"
         )
 
     if result.returncode != 0:
@@ -107,7 +112,8 @@ def video_info(source):
         duration = float(result.stdout.strip())
     except ValueError:
         raise HTTPException(
-            422, "Cannot read video duration"
+            422,
+            "Cannot read video duration"
         )
 
     if not 0 < duration <= 60:
@@ -138,7 +144,8 @@ def send_video(output, folder, filename):
         or output.stat().st_size == 0
     ):
         raise HTTPException(
-            422, "Output video was not created"
+            422,
+            "Output video was not created"
         )
 
     return FileResponse(
@@ -153,6 +160,69 @@ def send_video(output, folder, filename):
     )
 
 
+def render_segments(source, output, keep):
+    if not keep or len(keep) > 12:
+        raise HTTPException(
+            422,
+            "Too many edits for this free instance"
+        )
+
+    filters = []
+
+    for i, (a, b) in enumerate(keep):
+        segment_duration = b - a
+
+        fade = min(
+            0.025,
+            segment_duration / 4
+        )
+
+        filters.append(
+            f"[0:v]trim=start={a:.4f}:end={b:.4f},"
+            f"setpts=PTS-STARTPTS[v{i}]"
+        )
+
+        filters.append(
+            f"[0:a]atrim=start={a:.4f}:end={b:.4f},"
+            f"asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d={fade:.4f},"
+            f"afade=t=out:"
+            f"st={segment_duration-fade:.4f}:"
+            f"d={fade:.4f}[a{i}]"
+        )
+
+    streams = "".join(
+        f"[v{i}][a{i}]"
+        for i in range(len(keep))
+    )
+
+    filters.append(
+        f"{streams}"
+        f"concat=n={len(keep)}:"
+        "v=1:a=1[vout][aout]"
+    )
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-threads", "1",
+        "-filter_threads", "1",
+        "-i", str(source),
+        "-filter_complex", ";".join(filters),
+        "-map", "[vout]",
+        "-map", "[aout]",
+        *encode_settings(),
+        str(output)
+    ]
+
+    run_command(
+        command,
+        timeout=180
+    )
+
+
 @app.post("/trim")
 async def trim_video(
     file: UploadFile = File(...),
@@ -161,7 +231,8 @@ async def trim_video(
 ):
     if start < 0 or not 0 < duration <= 120:
         raise HTTPException(
-            400, "Invalid start or duration"
+            400,
+            "Invalid start or duration"
         )
 
     folder = Path(
@@ -202,7 +273,8 @@ async def trim_video(
 
     except Exception:
         shutil.rmtree(
-            folder, ignore_errors=True
+            folder,
+            ignore_errors=True
         )
         raise
 
@@ -230,7 +302,6 @@ async def smart_speech(
         duration = video_info(source)
         output = folder / "smart_speech.mp4"
 
-        # Detect silence in the original audio.
         detection = run_command([
             "ffmpeg",
             "-hide_banner",
@@ -243,7 +314,6 @@ async def smart_speech(
             "-"
         ], timeout=90)
 
-        # Read silence events in chronological order.
         events = re.findall(
             r"silence_(start|end):\s*([\d.]+)",
             detection.stderr
@@ -263,6 +333,7 @@ async def smart_speech(
                     silences.append(
                         (silence_start, timestamp)
                     )
+
                 silence_start = None
 
         if silence_start is not None:
@@ -270,8 +341,6 @@ async def smart_speech(
                 (silence_start, duration)
             )
 
-        # Keep a natural pause of up to 0.30 s.
-        # Remove only the excess silence.
         keep = []
         cursor = 0.0
         natural_pause = 0.30
@@ -280,12 +349,9 @@ async def smart_speech(
             a = max(0.0, min(a, duration))
             b = max(a, min(b, duration))
 
-            silence_length = b - a
-
-            if silence_length <= natural_pause:
+            if b - a <= natural_pause:
                 continue
 
-            # Preserve 0.15 s at each side.
             cut_start = a + natural_pause / 2
             cut_end = b - natural_pause / 2
 
@@ -301,65 +367,13 @@ async def smart_speech(
                 (cursor, duration)
             )
 
-        # Protect the free Render instance.
         if not keep or len(keep) > 12:
             keep = [(0.0, duration)]
 
-        filters = []
-
-        for i, (a, b) in enumerate(keep):
-            segment_duration = b - a
-
-            # Small audio fades reduce clicks
-            # at the start and end of each segment.
-            fade = min(
-                0.025,
-                segment_duration / 4
-            )
-
-            filters.append(
-                f"[0:v]trim=start={a}:end={b},"
-                f"setpts=PTS-STARTPTS[v{i}]"
-            )
-
-            filters.append(
-                f"[0:a]atrim=start={a}:end={b},"
-                f"asetpts=PTS-STARTPTS,"
-                f"afade=t=in:st=0:d={fade:.4f},"
-                f"afade=t=out:"
-                f"st={segment_duration - fade:.4f}:"
-                f"d={fade:.4f}[a{i}]"
-            )
-
-        streams = "".join(
-            f"[v{i}][a{i}]"
-            for i in range(len(keep))
-        )
-
-        filters.append(
-            f"{streams}"
-            f"concat=n={len(keep)}:"
-            "v=1:a=1[vout][aout]"
-        )
-
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-y",
-            "-threads", "1",
-            "-filter_threads", "1",
-            "-i", str(source),
-            "-filter_complex", ";".join(filters),
-            "-map", "[vout]",
-            "-map", "[aout]",
-            *encode_settings(),
-            str(output)
-        ]
-
-        run_command(
-            command,
-            timeout=180
+        render_segments(
+            source,
+            output,
+            keep
         )
 
         return send_video(
@@ -370,7 +384,196 @@ async def smart_speech(
 
     except Exception:
         shutil.rmtree(
-            folder, ignore_errors=True
+            folder,
+            ignore_errors=True
+        )
+        raise
+
+    finally:
+        await file.close()
+
+
+def vosk_words(source):
+    try:
+        with source.open("rb") as stream:
+            response = requests.post(
+                VOSK_URL,
+                files={
+                    "file": (
+                        source.name,
+                        stream,
+                        "application/octet-stream"
+                    )
+                },
+                timeout=(25, 240)
+            )
+
+        response.raise_for_status()
+        data = response.json()
+
+    except (
+        requests.RequestException,
+        ValueError
+    ) as exc:
+        logger.warning(
+            "Vosk unavailable: %s",
+            exc
+        )
+
+        raise HTTPException(
+            502,
+            "Vosk service unavailable or timed out"
+        )
+
+    words = data.get("words")
+
+    if not isinstance(words, list):
+        raise HTTPException(
+            502,
+            "Vosk response has no word timings"
+        )
+
+    return words
+
+
+def repeated_word_cuts(words, duration):
+    # Remove only short adjacent duplicate words.
+    # Partial syllables are not detected here.
+
+    cuts = []
+
+    for prev, curr in zip(words, words[1:]):
+        try:
+            first = str(
+                prev["word"]
+            ).lower().strip(".,!?;: ")
+
+            second = str(
+                curr["word"]
+            ).lower().strip(".,!?;: ")
+
+            a = float(prev["start"])
+            b = float(prev["end"])
+            c = float(curr["start"])
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ):
+            continue
+
+        if (
+            first
+            and first == second
+            and len(first) >= 3
+            and 0.08 <= b - a <= 0.7
+            and 0 <= c - b <= 0.20
+            and 0 <= a < b <= duration
+        ):
+            cut_a = max(
+                0.0,
+                a + 0.02
+            )
+
+            cut_b = min(
+                duration,
+                b - 0.02
+            )
+
+            if cut_b - cut_a >= 0.08:
+                cuts.append(
+                    (cut_a, cut_b)
+                )
+
+    cuts.sort()
+    nonoverlap = []
+
+    for a, b in cuts:
+        if (
+            not nonoverlap
+            or a >= nonoverlap[-1][1]
+        ):
+            nonoverlap.append(
+                (a, b)
+            )
+
+    return nonoverlap[:8]
+
+
+def keep_from_cuts(cuts, duration):
+    keep = []
+    cursor = 0.0
+
+    for a, b in cuts:
+        if a > cursor + 0.04:
+            keep.append(
+                (cursor, a)
+            )
+
+        cursor = max(
+            cursor,
+            b
+        )
+
+    if duration > cursor + 0.04:
+        keep.append(
+            (cursor, duration)
+        )
+
+    return keep or [
+        (0.0, duration)
+    ]
+
+
+@app.post("/smart-speech-v3")
+async def smart_speech_v3(
+    file: UploadFile = File(...)
+):
+    folder = Path(
+        tempfile.mkdtemp(prefix="reels_v3_")
+    )
+
+    try:
+        source = await save_upload(
+            file,
+            folder
+        )
+
+        duration = video_info(source)
+
+        words = vosk_words(source)
+
+        cuts = repeated_word_cuts(
+            words,
+            duration
+        )
+
+        keep = keep_from_cuts(
+            cuts,
+            duration
+        )
+
+        output = (
+            folder / "smart_speech_v3.mp4"
+        )
+
+        render_segments(
+            source,
+            output,
+            keep
+        )
+
+        return send_video(
+            output,
+            folder,
+            "smart_speech_v3.mp4"
+        )
+
+    except Exception:
+        shutil.rmtree(
+            folder,
+            ignore_errors=True
         )
         raise
 
